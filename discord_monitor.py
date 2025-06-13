@@ -6,6 +6,7 @@ import os
 from datetime import datetime, timedelta
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
+import pytz
 
 load_dotenv()
 
@@ -21,6 +22,17 @@ NOTION_DATABASE_ID = os.getenv('NOTION_DATABASE_ID')
 CHANNEL_ID = int(os.getenv('CHANNEL_ID')) if os.getenv('CHANNEL_ID') else None
 CISO_NAME = os.getenv('CISO_NAME', 'Your CISO')  # Your actual name
 
+# Timezone setup
+SAST = pytz.timezone('Africa/Johannesburg')
+
+def get_sa_time():
+    """Get current time in South African timezone"""
+    return datetime.now(SAST)
+
+def get_sa_date():
+    """Get current date in South African timezone"""
+    return get_sa_time().date()
+
 # Notion API headers
 NOTION_HEADERS = {
     'Authorization': f'Bearer {NOTION_TOKEN}',
@@ -34,7 +46,7 @@ def parse_ciso_update(message_content):
         # Extract date
         date_pattern = r'Daily CISO Update - (.+?)(?:\n|$)'
         date_match = re.search(date_pattern, message_content, re.IGNORECASE)
-        date_str = date_match.group(1).strip() if date_match else datetime.now().strftime('%Y-%m-%d')
+        date_str = date_match.group(1).strip() if date_match else get_sa_date().strftime('%Y-%m-%d')
         
         # Extract student name
         student_pattern = r'Student:\s*(.+?)(?:\n|$)'
@@ -84,20 +96,23 @@ def create_notion_entry(parsed_data):
     try:
         # Parse date string to ISO format for Notion
         try:
-            parsed_date = datetime.strptime(parsed_data['date'], '%Y-%m-%d').isoformat()
+            parsed_date = datetime.strptime(parsed_data['date'], '%Y-%m-%d')
+            # Convert to SAST timezone
+            parsed_date = SAST.localize(parsed_date)
         except:
             # Try different date formats
             try:
-                parsed_date = datetime.strptime(parsed_data['date'], '%m/%d/%Y').isoformat()
+                parsed_date = datetime.strptime(parsed_data['date'], '%m/%d/%Y')
+                parsed_date = SAST.localize(parsed_date)
             except:
-                parsed_date = datetime.now().isoformat()
+                parsed_date = get_sa_time()
         
         # Notion database entry structure
         data = {
             "parent": {"database_id": NOTION_DATABASE_ID},
             "properties": {
                 "Date": {
-                    "date": {"start": parsed_date.split('T')[0]}
+                    "date": {"start": parsed_date.strftime('%Y-%m-%d')}
                 },
                 "Student Name": {
                     "title": [{"text": {"content": parsed_data['student_name']}}]
@@ -148,7 +163,7 @@ def get_entries_with_responses(target_date=None):
     """Fetch Notion entries that have CISO responses but haven't been sent yet"""
     try:
         if target_date is None:
-            target_date = datetime.now().strftime('%Y-%m-%d')
+            target_date = get_sa_date().strftime('%Y-%m-%d')
         
         # Query Notion database for entries with responses
         query_data = {
@@ -299,9 +314,33 @@ Your CISO
     except Exception as e:
         print(f"Error sending response to {student_name}: {e}")
         return False
+
+@bot.event
 async def on_ready():
-    print(f'{bot.user} has connected to Discord!')
-    print(f'Monitoring channel ID: {CHANNEL_ID}')
+    print(f'Bot is ready! Logged in as {bot.user.name}')
+    check_daily_updates.start()
+
+@tasks.loop(minutes=30)
+async def check_daily_updates():
+    """Check for daily updates at 18:00 SAST"""
+    current_time = get_sa_time()
+    
+    # Check if it's 18:00 SAST
+    if current_time.hour == 18 and current_time.minute < 30:
+        channel = bot.get_channel(CHANNEL_ID)
+        if channel:
+            await channel.send(f"@everyone It's time for your daily CISO update! Please use the following format:\n\n"
+                             f"Daily CISO Update - {current_time.strftime('%Y-%m-%d')}\n"
+                             f"Student: [Your Name]\n"
+                             f"Hours Worked: [Number]\n"
+                             f"Completed Today:\n"
+                             f"[List what you completed today]\n\n"
+                             f"Current Findings/Issues:\n"
+                             f"[List any findings or issues]\n\n"
+                             f"Tomorrow's Plan:\n"
+                             f"[List your plan for tomorrow]\n\n"
+                             f"CISO Input Needed:\n"
+                             f"[List any questions or input needed from the CISO]")
 
 @bot.event
 async def on_message(message):
@@ -412,7 +451,7 @@ Try sending it again with the correct format! 📝
 async def send_daily_responses(ctx, date=None):
     """Send all pending CISO responses for a specific date"""
     if date is None:
-        date = datetime.now().strftime('%Y-%m-%d')
+        date = get_sa_date().strftime('%Y-%m-%d')
     
     await ctx.send(f"🔍 Checking for pending CISO responses for {date}...")
     
@@ -463,9 +502,9 @@ All students have received their personalized feedback from {CISO_NAME}!"""
 
 @bot.command(name='preview_responses')
 async def preview_responses(ctx, date=None):
-    """Preview what responses will be sent without actually sending them"""
+    """Preview pending CISO responses without sending them"""
     if date is None:
-        date = datetime.now().strftime('%Y-%m-%d')
+        date = get_sa_date().strftime('%Y-%m-%d')
     
     entries = get_entries_with_responses(date)
     
@@ -490,9 +529,9 @@ async def preview_responses(ctx, date=None):
 
 @bot.command(name='response_count')
 async def response_count(ctx, date=None):
-    """Show count of pending responses"""
+    """Show count of pending responses for a specific date"""
     if date is None:
-        date = datetime.now().strftime('%Y-%m-%d')
+        date = get_sa_date().strftime('%Y-%m-%d')
     
     entries = get_entries_with_responses(date)
     count = len(entries)
@@ -501,30 +540,6 @@ async def response_count(ctx, date=None):
         await ctx.send(f"📭 No pending responses for {date}")
     else:
         await ctx.send(f"📬 **{count}** pending responses ready to send for {date}")
-
-# Commented out automatic daily sending - uncomment and configure if needed
-# @tasks.loop(time=datetime.time(18, 0))  # 6 PM daily
-# async def daily_response_sender():
-#     """Automatically send responses daily at 6 PM"""
-#     date = datetime.now().strftime('%Y-%m-%d')
-#     entries = get_entries_with_responses(date)
-#     
-#     if not entries:
-#         return
-#     
-#     sent_count = 0
-#     for entry in entries:
-#         response_data = extract_response_data(entry)
-#         if response_data:
-#             success = await send_ciso_response(
-#                 response_data['student_name'],
-#                 response_data['date'],
-#                 response_data['ciso_response']
-#             )
-#             if success and mark_response_sent(response_data['entry_id']):
-#                 sent_count += 1
-#     
-#     print(f"Daily auto-send complete: {sent_count} responses sent")
 
 @bot.command(name='test')
 async def test_bot(ctx):
