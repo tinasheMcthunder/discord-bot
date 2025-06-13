@@ -15,6 +15,10 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
+# Message deduplication tracking
+processed_messages = set()
+MAX_PROCESSED_CACHE = 1000  # Prevent memory buildup
+
 # Environment variables
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 NOTION_TOKEN = os.getenv('NOTION_TOKEN')
@@ -407,7 +411,15 @@ Your CISO
 
 @bot.event
 async def on_ready():
-    print(f'Bot is ready! Logged in as {bot.user.name}')
+    print(f'Bot is ready! Logged in as {bot.user.name} (ID: {bot.user.id})')
+    print(f'Connected to {len(bot.guilds)} guilds')
+    
+    # Check if this is a reconnection (potential duplicate instance)
+    if hasattr(bot, '_ready_called'):
+        print("⚠️ WARNING: on_ready called multiple times - possible duplicate instance!")
+        return
+    
+    bot._ready_called = True
     auto_send_daily_responses.start()
 
 @tasks.loop(minutes=30)
@@ -483,9 +495,28 @@ All available responses from {CISO_NAME} have been delivered automatically!"""
 
 @bot.event
 async def on_message(message):
-    # Ignore messages from the bot itself
+    # Ignore messages from the bot itself (CRITICAL - prevents loops)
     if message.author == bot.user:
         return
+    
+    # Additional safety: ignore all bot messages
+    if message.author.bot:
+        return
+    
+    # Message deduplication check
+    message_key = f"{message.id}_{message.author.id}_{message.content[:50]}"
+    if message_key in processed_messages:
+        print(f"🔄 Duplicate message detected and ignored from {message.author.name}")
+        return
+    
+    # Add to processed messages cache
+    processed_messages.add(message_key)
+    
+    # Clean cache if it gets too large
+    if len(processed_messages) > MAX_PROCESSED_CACHE:
+        # Remove oldest half
+        processed_messages.clear()
+        print("🧹 Cleared message deduplication cache")
     
     # Check if it's a DM or the specified channel
     is_dm = isinstance(message.channel, discord.DMChannel)
