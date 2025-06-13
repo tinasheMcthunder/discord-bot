@@ -21,6 +21,7 @@ NOTION_TOKEN = os.getenv('NOTION_TOKEN')
 NOTION_DATABASE_ID = os.getenv('NOTION_DATABASE_ID')
 CHANNEL_ID = int(os.getenv('CHANNEL_ID')) if os.getenv('CHANNEL_ID') else None
 CISO_NAME = os.getenv('CISO_NAME', 'Your CISO')  # Your actual name
+ADMIN_CODE = os.getenv('ADMIN_CODE')  # Secret admin authentication code
 
 # Timezone setup
 SAST = pytz.timezone('Africa/Johannesburg')
@@ -40,7 +41,7 @@ NOTION_HEADERS = {
     'Notion-Version': '2022-06-28'
 }
 
-def parse_ciso_update(message_content):
+def parse_ciso_update(message_content, author):
     """Parse the structured CISO update message"""
     try:
         # Extract date
@@ -48,10 +49,10 @@ def parse_ciso_update(message_content):
         date_match = re.search(date_pattern, message_content, re.IGNORECASE)
         date_str = date_match.group(1).strip() if date_match else get_sa_date().strftime('%Y-%m-%d')
         
-        # Extract student name
+        # Extract student name - prioritize from message, fallback to Discord display name
         student_pattern = r'Student:\s*(.+?)(?:\n|$)'
         student_match = re.search(student_pattern, message_content, re.IGNORECASE)
-        student_name = student_match.group(1).strip() if student_match else "Unknown"
+        student_name = student_match.group(1).strip() if student_match else (author.display_name or author.name)
         
         # Extract hours worked
         hours_pattern = r'Hours Worked:\s*(\d+)'
@@ -81,6 +82,9 @@ def parse_ciso_update(message_content):
         return {
             'date': date_str,
             'student_name': student_name,
+            'discord_user_id': str(author.id),  # Store Discord User ID
+            'discord_username': author.name,    # Store Discord username for reference
+            'discord_display_name': author.display_name or author.name,  # Store display name
             'hours_worked': hours_worked,
             'completed_today': completed_today,
             'current_findings': current_findings,
@@ -107,7 +111,7 @@ def create_notion_entry(parsed_data):
             except:
                 parsed_date = get_sa_time()
         
-        # Notion database entry structure
+        # Notion database entry structure - UPDATED with Discord fields
         data = {
             "parent": {"database_id": NOTION_DATABASE_ID},
             "properties": {
@@ -116,6 +120,15 @@ def create_notion_entry(parsed_data):
                 },
                 "Student Name": {
                     "title": [{"text": {"content": parsed_data['student_name']}}]
+                },
+                "Discord User ID": {
+                    "rich_text": [{"text": {"content": parsed_data['discord_user_id']}}]
+                },
+                "Discord Username": {
+                    "rich_text": [{"text": {"content": parsed_data['discord_username']}}]
+                },
+                "Discord Display Name": {
+                    "rich_text": [{"text": {"content": parsed_data['discord_display_name']}}]
                 },
                 "Hours Worked": {
                     "number": parsed_data['hours_worked']
@@ -165,14 +178,14 @@ def get_entries_with_responses(target_date=None):
         if target_date is None:
             target_date = get_sa_date().strftime('%Y-%m-%d')
         
-        # Query Notion database for entries with responses
+        # Query Notion database for entries with responses - ONLY for the specific date
         query_data = {
             "filter": {
                 "and": [
                     {
                         "property": "Date",
                         "date": {
-                            "equals": target_date
+                            "equals": target_date  # STRICT date matching
                         }
                     },
                     {
@@ -204,7 +217,22 @@ def get_entries_with_responses(target_date=None):
         )
         
         if response.status_code == 200:
-            return response.json()['results']
+            results = response.json()['results']
+            
+            # ADDITIONAL SAFETY CHECK: Double-verify the date matches
+            filtered_results = []
+            for entry in results:
+                entry_date = ""
+                if 'Date' in entry['properties'] and entry['properties']['Date']['date']:
+                    entry_date = entry['properties']['Date']['date']['start']
+                
+                # Only include if date exactly matches target date
+                if entry_date == target_date:
+                    filtered_results.append(entry)
+                else:
+                    print(f"⚠️ Filtered out entry with mismatched date: {entry_date} != {target_date}")
+            
+            return filtered_results
         else:
             print(f"Error fetching entries: {response.status_code} - {response.text}")
             return []
@@ -214,7 +242,7 @@ def get_entries_with_responses(target_date=None):
         return []
 
 def extract_response_data(notion_entry):
-    """Extract relevant data from Notion entry"""
+    """Extract relevant data from Notion entry - UPDATED to include Discord User ID"""
     try:
         properties = notion_entry['properties']
         
@@ -222,6 +250,21 @@ def extract_response_data(notion_entry):
         student_name = ""
         if 'Student Name' in properties and properties['Student Name']['title']:
             student_name = properties['Student Name']['title'][0]['text']['content']
+        
+        # Extract Discord User ID
+        discord_user_id = ""
+        if 'Discord User ID' in properties and properties['Discord User ID']['rich_text']:
+            discord_user_id = properties['Discord User ID']['rich_text'][0]['text']['content']
+        
+        # Extract Discord Username (fallback)
+        discord_username = ""
+        if 'Discord Username' in properties and properties['Discord Username']['rich_text']:
+            discord_username = properties['Discord Username']['rich_text'][0]['text']['content']
+        
+        # Extract Discord Display Name (fallback)
+        discord_display_name = ""
+        if 'Discord Display Name' in properties and properties['Discord Display Name']['rich_text']:
+            discord_display_name = properties['Discord Display Name']['rich_text'][0]['text']['content']
         
         # Extract date
         entry_date = ""
@@ -236,6 +279,9 @@ def extract_response_data(notion_entry):
         return {
             'entry_id': notion_entry['id'],
             'student_name': student_name,
+            'discord_user_id': discord_user_id,
+            'discord_username': discord_username,
+            'discord_display_name': discord_display_name,
             'date': entry_date,
             'ciso_response': ciso_response
         }
@@ -244,13 +290,27 @@ def extract_response_data(notion_entry):
         print(f"Error extracting response data: {e}")
         return None
 
-def mark_response_sent(entry_id):
+def verify_admin_code(provided_code):
+    """Verify if the provided admin code is correct"""
+    if not ADMIN_CODE:
+        return False  # If no admin code is set, deny access
+    return provided_code == ADMIN_CODE
+
+async def require_admin_auth(ctx, provided_code):
+    """Check admin authentication and send error message if invalid"""
+    if not verify_admin_code(provided_code):
+        await ctx.send("🚫 **Access Denied** - Invalid admin code. Contact your CISO for the correct authentication code.")
+        return False
+    return True
     """Mark a Notion entry as response sent"""
     try:
         update_data = {
             "properties": {
                 "Response Sent": {
                     "checkbox": True
+                },
+                "Status": {
+                    "select": {"name": "Responded"}
                 }
             }
         }
@@ -267,33 +327,60 @@ def mark_response_sent(entry_id):
         print(f"Error marking response as sent: {e}")
         return False
 
-async def send_ciso_response(student_name, date, response_text):
-    """Send CISO response to student via DM"""
+async def send_ciso_response(response_data):
+    """Send CISO response to student via DM - UPDATED to use Discord User ID"""
     try:
-        # Find the user by name (this is a simplified approach)
-        # In production, you might want to store Discord user IDs in Notion
         user = None
-        for guild in bot.guilds:
-            for member in guild.members:
-                if member.display_name.lower() == student_name.lower() or member.name.lower() == student_name.lower():
-                    user = member
+        
+        # Primary method: Use Discord User ID
+        if response_data['discord_user_id']:
+            try:
+                user_id = int(response_data['discord_user_id'])
+                user = bot.get_user(user_id)
+                if not user:
+                    # Try fetching if not in cache
+                    user = await bot.fetch_user(user_id)
+                print(f"✅ Found user by ID: {user.name} ({user_id})")
+            except (ValueError, discord.NotFound) as e:
+                print(f"⚠️ Could not find user by ID {response_data['discord_user_id']}: {e}")
+        
+        # Fallback method: Search by display name or username
+        if not user:
+            print(f"🔍 Falling back to name search for: {response_data['student_name']}")
+            for guild in bot.guilds:
+                for member in guild.members:
+                    # Check multiple name variations
+                    names_to_check = [
+                        response_data['student_name'].lower(),
+                        response_data['discord_display_name'].lower(),
+                        response_data['discord_username'].lower()
+                    ]
+                    
+                    member_names = [
+                        member.display_name.lower(),
+                        member.name.lower()
+                    ]
+                    
+                    if any(name in member_names for name in names_to_check if name):
+                        user = member
+                        print(f"✅ Found user by name search: {user.name}")
+                        break
+                if user:
                     break
-            if user:
-                break
         
         if not user:
-            print(f"Could not find Discord user for: {student_name}")
-            return False
+            print(f"❌ Could not find Discord user for: {response_data['student_name']} (ID: {response_data['discord_user_id']})")
+            return False, f"User not found: {response_data['student_name']}"
         
         # Format the message
         message = f"""🛡️ **Message from your CISO - {CISO_NAME}**
 *Delivered via Elliot Alderson Bot*
 
-Hi {student_name},
+Hi {response_data['student_name']},
 
-I've reviewed your journal entry from {date}. Here's my personal feedback:
+I've reviewed your journal entry from {response_data['date']}. Here's my personal feedback:
 
-{response_text}
+{response_data['ciso_response']}
 
 Remember, I'm always here to support your cybersecurity journey. Feel free to reach out directly if you need immediate assistance.
 
@@ -306,41 +393,93 @@ Your CISO
         
         # Send DM
         await user.send(message)
-        return True
+        print(f"📤 Response sent successfully to {user.name}")
+        return True, f"Message sent to {user.name}"
         
     except discord.Forbidden:
-        print(f"Cannot send DM to {student_name} - DMs might be disabled")
-        return False
+        error_msg = f"Cannot send DM to {response_data['student_name']} - DMs might be disabled"
+        print(f"🚫 {error_msg}")
+        return False, error_msg
     except Exception as e:
-        print(f"Error sending response to {student_name}: {e}")
-        return False
+        error_msg = f"Error sending response to {response_data['student_name']}: {e}"
+        print(f"❌ {error_msg}")
+        return False, error_msg
 
 @bot.event
 async def on_ready():
     print(f'Bot is ready! Logged in as {bot.user.name}')
-    check_daily_updates.start()
+    auto_send_daily_responses.start()
 
 @tasks.loop(minutes=30)
-async def check_daily_updates():
-    """Check for daily updates at 18:00 SAST"""
+async def auto_send_daily_responses():
+    """Automatically send CISO responses at 18:00 SAST"""
     current_time = get_sa_time()
     
-    # Check if it's 18:00 SAST
+    # Check if it's 18:00 SAST (between 18:00-18:30 to avoid duplicates)
     if current_time.hour == 18 and current_time.minute < 30:
-        channel = bot.get_channel(CHANNEL_ID)
-        if channel:
-            await channel.send(f"@everyone It's time for your daily CISO update! Please use the following format:\n\n"
-                             f"Daily CISO Update - {current_time.strftime('%Y-%m-%d')}\n"
-                             f"Student: [Your Name]\n"
-                             f"Hours Worked: [Number]\n"
-                             f"Completed Today:\n"
-                             f"[List what you completed today]\n\n"
-                             f"Current Findings/Issues:\n"
-                             f"[List any findings or issues]\n\n"
-                             f"Tomorrow's Plan:\n"
-                             f"[List your plan for tomorrow]\n\n"
-                             f"CISO Input Needed:\n"
-                             f"[List any questions or input needed from the CISO]")
+        current_date = current_time.strftime('%Y-%m-%d')
+        
+        print(f"🕕 18:00 SAST - Auto-sending daily CISO responses for {current_date}")
+        
+        # Get entries with responses for today
+        entries = get_entries_with_responses(current_date)
+        
+        if not entries:
+            print(f"📭 No pending CISO responses found for {current_date}")
+            return
+        
+        sent_count = 0
+        failed_count = 0
+        failed_details = []
+        
+        print(f"📬 Found {len(entries)} pending responses to send...")
+        
+        for entry in entries:
+            response_data = extract_response_data(entry)
+            if not response_data:
+                failed_count += 1
+                failed_details.append("Failed to extract response data")
+                continue
+            
+            # Send the response
+            success, message = await send_ciso_response(response_data)
+            
+            if success:
+                # Mark as sent in Notion
+                if mark_response_sent(response_data['entry_id']):
+                    sent_count += 1
+                    print(f"✅ Auto-sent response to {response_data['student_name']}")
+                else:
+                    failed_count += 1
+                    failed_details.append(f"{response_data['student_name']}: Failed to mark as sent in Notion")
+                    print(f"❌ Failed to mark response as sent for {response_data['student_name']}")
+            else:
+                failed_count += 1
+                failed_details.append(f"{response_data['student_name']}: {message}")
+        
+        # Log summary to console and include date verification
+        print(f"📊 Auto-send complete for {current_date}: {sent_count} sent, {failed_count} failed")
+        print(f"🔒 SAFETY: Only processed entries with date = {current_date}")
+        
+        # Optionally send summary to admin channel (if you want notifications)
+        if CHANNEL_ID:
+            channel = bot.get_channel(CHANNEL_ID)
+            if channel and (sent_count > 0 or failed_count > 0):
+                summary = f"""🤖 **Automated CISO Response Delivery - {current_date}**
+
+✅ **Successfully sent:** {sent_count} responses
+❌ **Failed:** {failed_count} responses
+🔒 **Date Filter:** Only {current_date} entries processed
+
+All available responses from {CISO_NAME} have been delivered automatically!"""
+                
+                if failed_count > 0 and len(failed_details) <= 3:
+                    summary += f"\n\n**Failed Details:**\n" + "\n".join([f"• {detail}" for detail in failed_details])
+                
+                try:
+                    await channel.send(summary)
+                except Exception as e:
+                    print(f"Failed to send auto-summary to channel: {e}")
 
 @bot.event
 async def on_message(message):
@@ -360,10 +499,10 @@ async def on_message(message):
     # Check if message starts with "Daily CISO Update"
     if message.content.lower().startswith('daily ciso update'):
         message_type = "DM" if is_dm else "channel"
-        print(f"CISO update detected from {message.author.name} via {message_type}")
+        print(f"CISO update detected from {message.author.name} (ID: {message.author.id}) via {message_type}")
         
-        # Parse the message
-        parsed_data = parse_ciso_update(message.content)
+        # Parse the message - UPDATED to pass author object
+        parsed_data = parse_ciso_update(message.content, message.author)
         
         if parsed_data:
             # Create Notion entry
@@ -379,10 +518,11 @@ async def on_message(message):
 **CISO Update Processed Successfully!** ✅
 
 **Student:** {parsed_data['student_name']}
+**Discord ID:** {parsed_data['discord_user_id']}
 **Date:** {parsed_data['date']}
 **Hours:** {parsed_data['hours_worked']}
 
-Your journal entry has been recorded in the database. I'll review it and may send you personalized feedback later today.
+Your journal entry has been recorded in the database with your Discord information for reliable message delivery. I'll review it and may send you personalized feedback later today.
 
 Keep up the excellent work on your cybersecurity journey! 🎯
 
@@ -390,7 +530,7 @@ Keep up the excellent work on your cybersecurity journey! 🎯
                     """
                     await message.channel.send(confirmation_msg)
                 
-                print(f"Successfully processed update for {parsed_data['student_name']} via {message_type}")
+                print(f"Successfully processed update for {parsed_data['student_name']} (ID: {parsed_data['discord_user_id']}) via {message_type}")
                 
             else:
                 # React with X to indicate error
@@ -448,8 +588,13 @@ Try sending it again with the correct format! 📝
     await bot.process_commands(message)
 
 @bot.command(name='send_responses')
-async def send_daily_responses(ctx, date=None):
-    """Send all pending CISO responses for a specific date"""
+async def send_daily_responses(ctx, admin_code: str = None, date: str = None):
+    """Send all pending CISO responses for a specific date - ADMIN ONLY"""
+    
+    # Check admin authentication
+    if not await require_admin_auth(ctx, admin_code):
+        return
+    
     if date is None:
         date = get_sa_date().strftime('%Y-%m-%d')
     
@@ -464,19 +609,17 @@ async def send_daily_responses(ctx, date=None):
     
     sent_count = 0
     failed_count = 0
+    failed_details = []
     
     for entry in entries:
         response_data = extract_response_data(entry)
         if not response_data:
             failed_count += 1
+            failed_details.append("Failed to extract response data")
             continue
         
-        # Send the response
-        success = await send_ciso_response(
-            response_data['student_name'],
-            response_data['date'],
-            response_data['ciso_response']
-        )
+        # Send the response - UPDATED function call
+        success, message = await send_ciso_response(response_data)
         
         if success:
             # Mark as sent in Notion
@@ -485,9 +628,11 @@ async def send_daily_responses(ctx, date=None):
                 print(f"✅ Response sent to {response_data['student_name']}")
             else:
                 failed_count += 1
+                failed_details.append(f"{response_data['student_name']}: Failed to mark as sent in Notion")
                 print(f"❌ Failed to mark response as sent for {response_data['student_name']}")
         else:
             failed_count += 1
+            failed_details.append(f"{response_data['student_name']}: {message}")
     
     # Send summary
     summary = f"""📊 **Response Sending Complete**
@@ -496,13 +641,23 @@ async def send_daily_responses(ctx, date=None):
 ❌ **Failed:** {failed_count} responses
 📅 **Date:** {date}
 
-All students have received their personalized feedback from {CISO_NAME}!"""
+All successful responses have been delivered from {CISO_NAME}!"""
+    
+    if failed_details:
+        summary += f"\n\n**Failed Details:**\n" + "\n".join([f"• {detail}" for detail in failed_details[:5]])
+        if len(failed_details) > 5:
+            summary += f"\n• ... and {len(failed_details) - 5} more"
     
     await ctx.send(summary)
 
 @bot.command(name='preview_responses')
-async def preview_responses(ctx, date=None):
-    """Preview pending CISO responses without sending them"""
+async def preview_responses(ctx, admin_code: str = None, date: str = None):
+    """Preview pending CISO responses without sending them - ADMIN ONLY"""
+    
+    # Check admin authentication
+    if not await require_admin_auth(ctx, admin_code):
+        return
+    
     if date is None:
         date = get_sa_date().strftime('%Y-%m-%d')
     
@@ -517,7 +672,8 @@ async def preview_responses(ctx, date=None):
     for i, entry in enumerate(entries, 1):
         response_data = extract_response_data(entry)
         if response_data:
-            preview_msg += f"**{i}. {response_data['student_name']}**\n"
+            discord_info = f"(ID: {response_data['discord_user_id'][:8]}...)" if response_data['discord_user_id'] else "(No ID stored)"
+            preview_msg += f"**{i}. {response_data['student_name']}** {discord_info}\n"
             preview_msg += f"Response: {response_data['ciso_response'][:100]}{'...' if len(response_data['ciso_response']) > 100 else ''}\n\n"
     
     # Discord has message length limits, so split if needed
@@ -525,11 +681,16 @@ async def preview_responses(ctx, date=None):
         preview_msg = preview_msg[:1900] + "\n\n*... (truncated for length)*"
     
     await ctx.send(preview_msg)
-    await ctx.send(f"📬 Ready to send {len(entries)} responses. Use `!send_responses` to send them.")
+    await ctx.send(f"📬 Ready to send {len(entries)} responses. Use `!send_responses [admin_code]` to send them.")
 
 @bot.command(name='response_count')
-async def response_count(ctx, date=None):
-    """Show count of pending responses for a specific date"""
+async def response_count(ctx, admin_code: str = None, date: str = None):
+    """Show count of pending responses for a specific date - ADMIN ONLY"""
+    
+    # Check admin authentication
+    if not await require_admin_auth(ctx, admin_code):
+        return
+    
     if date is None:
         date = get_sa_date().strftime('%Y-%m-%d')
     
@@ -541,10 +702,58 @@ async def response_count(ctx, date=None):
     else:
         await ctx.send(f"📬 **{count}** pending responses ready to send for {date}")
 
+@bot.command(name='send_reminder')
+async def send_journal_reminder(ctx):
+    """Manually send journal submission reminder"""
+    current_time = get_sa_time()
+    
+    reminder_msg = f"""@everyone It's time for your daily CISO update! Please use the following format:
+
+Daily CISO Update - {current_time.strftime('%Y-%m-%d')}
+Student: [Your Name]
+Hours Worked: [Number]
+Completed Today:
+[List what you completed today]
+
+Current Findings/Issues:
+[List any findings or issues]
+
+Tomorrow's Plan:
+[List your plan for tomorrow]
+
+CISO Input Needed:
+[List any questions or input needed from the CISO]"""
+    
+    await ctx.send(reminder_msg)
+    await ctx.send("📝 Journal submission reminder sent!")
+    """Test user lookup by Discord ID"""
+    if not user_id:
+        await ctx.send("Please provide a Discord User ID to test. Usage: `!test_user 123456789`")
+        return
+    
+    try:
+        user_id_int = int(user_id)
+        user = bot.get_user(user_id_int)
+        
+        if not user:
+            user = await bot.fetch_user(user_id_int)
+        
+        if user:
+            await ctx.send(f"✅ **User Found!**\n**Name:** {user.name}\n**Display Name:** {user.display_name}\n**ID:** {user.id}")
+        else:
+            await ctx.send(f"❌ User with ID {user_id} not found")
+            
+    except ValueError:
+        await ctx.send(f"❌ Invalid user ID format: {user_id}")
+    except discord.NotFound:
+        await ctx.send(f"❌ User with ID {user_id} not found")
+    except Exception as e:
+        await ctx.send(f"❌ Error looking up user: {e}")
+
 @bot.command(name='test')
 async def test_bot(ctx):
     """Test command to verify bot is working"""
-    await ctx.send("Elliot Alderson (CISO Bot) is online and monitoring! ✅\n*Ready to process journals and send CISO responses.*")
+    await ctx.send("Elliot Alderson (CISO Bot) is online and monitoring! ✅\n*Ready to process journals with Discord User ID tracking and send CISO responses.*")
 
 @bot.command(name='format')
 async def format_command(ctx):
@@ -575,6 +784,9 @@ CISO Input Needed:
 - [Questions or guidance you need]
 ```
 
+**New Feature: Discord ID Tracking** 🆔
+Your Discord User ID is now automatically stored for reliable message delivery!
+
 **Bot Reactions:**
 ✅ - Successfully processed and saved to database
 ❌ - Error occurred while saving
@@ -582,7 +794,11 @@ CISO Input Needed:
 
 **Commands:**
 - `!test` - Test if bot is responding
-- `!status` - Show bot configuration status
+- `!test_user [user_id]` - Test Discord user lookup
+- `!send_responses [admin_code] [date]` - Send pending CISO responses (ADMIN ONLY)
+- `!preview_responses [admin_code] [date]` - Preview pending responses (ADMIN ONLY)
+- `!response_count [admin_code] [date]` - Check response count (ADMIN ONLY)
+- `!send_reminder` - Send journal submission reminder
 - `!help` - Show this help message
 
 **Example Journal Entry:**
@@ -609,7 +825,7 @@ CISO Input Needed:
 - What's the escalation process for security incidents?
 ```
 
-Happy journaling! 🛡️
+Happy journaling with improved reliability! 🛡️
 
 *- Elliot Alderson, CISO Bot Assistant*
     """
@@ -633,6 +849,11 @@ if __name__ == '__main__':
     if not NOTION_DATABASE_ID:
         print("ERROR: NOTION_DATABASE_ID environment variable not set")
         exit(1)
+    if not ADMIN_CODE:
+        print("WARNING: ADMIN_CODE environment variable not set - admin commands will be disabled")
+    
+    print("🚀 Starting Enhanced CISO Bot with Discord User ID tracking...")
+    print(f"🔐 Admin protection: {'ENABLED' if ADMIN_CODE else 'DISABLED'}")
     
     # Start the bot
     bot.run(DISCORD_TOKEN)
